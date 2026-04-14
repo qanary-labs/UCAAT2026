@@ -7,7 +7,7 @@ test.describe("Auth flow", () => {
 
     await page.getByLabel("Username").fill("admin");
     await page.getByLabel("Password").fill("password");
-    await page.getByRole("button", { name: /sign in/i }).click();
+    await page.getByRole("button", { name: /connect/i }).click();
 
     await expect(page).toHaveURL(/\/admin$/);
     await expect(page.getByRole("heading", { name: /protected admin zone/i })).toBeVisible();
