@@ -1,0 +1,202 @@
+name: QA Self-Healing
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "tests/**"
+      - "server.js"
+      - "public/**"
+      - "playwright.config.js"
+      - "package*.json"
+
+concurrency:
+  group: qa-heal-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  qa:
+    name: Run E2E tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+
+      - run: npm ci
+
+      - run: npx playwright install --with-deps chromium
+
+      - name: Run Playwright tests
+        run: npx playwright test
+        env:
+          CI: "true"
+
+      - name: Upload test artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: playwright-results
+          path: |
+            playwright-report/
+            test-results/
+          retention-days: 3
+
+  self-heal:
+    name: Self-heal failing tests
+    needs: qa
+    if: |
+      failure()
+      && needs.qa.result == 'failure'
+      && github.actor != 'github-actions[bot]'
+      && !contains(github.event.head_commit.message, '[skip-heal]')
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+      pull-requests: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+
+      - run: npm ci
+
+      - run: npx playwright install --with-deps chromium
+
+      - name: Download test artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: playwright-results
+
+      - name: Generate commit diff context
+        run: git diff HEAD~1 HEAD -- server.js public/ > /tmp/app-diff.patch || true
+
+      - name: Install Claude Code CLI
+        run: npm install -g @anthropic-ai/claude-code
+
+      - name: Write prompt file
+        run: |
+          cat > /tmp/heal-prompt.txt <<'PROMPT'
+          You are the Playwright Test Healer running in CI mode.
+          Follow the instructions in .github/agents/playwright-test-healer.agent.md (section "CI mode").
+
+          ## Context
+
+          E2E tests failed on commit ${{ github.sha }}.
+          Commit message: "${{ github.event.head_commit.message }}"
+          Author: ${{ github.event.head_commit.author.name }}
+
+          ## Available artifacts
+
+          - playwright-report/results.json — structured test results (start here)
+          - playwright-report/ — full HTML report
+          - test-results/ — traces, screenshots, videos per failed test
+          - /tmp/app-diff.patch — diff of application code changes from this commit
+
+          ## Critical: p_test_outdated-based healing
+
+          For EACH failing test, you MUST compute a `p_test_outdated` score (0.0 to 1.0) — the
+          probability that the failure is caused by an outdated test, NOT an app bug.
+
+          - Score > 0.7: self-heal the test (fix selectors, assertions, expected values)
+          - Score 0.4 to 0.7: do NOT modify the test, report as "Diagnostic only"
+          - Score < 0.4: do NOT modify the test, flag as "Probable app bug"
+
+          Signals that INCREASE p_test_outdated (test is outdated):
+          - App diff renames a text/label/attribute AND the error is a missing selector or text mismatch
+          - The element still exists in HTML but with a different name, role, or attribute
+          - Only cosmetic changes (class, text, aria-label), page structure intact
+
+          Signals that DECREASE p_test_outdated (possible app bug):
+          - App diff modifies logic: routes, redirects, conditions, middleware, status codes
+          - Timeout, network error, or HTTP 5xx
+          - Expected element completely absent from HTML (removed, not renamed)
+          - Failure on functional behavior (URL, session state, redirect target)
+          - No relevant app diff — nothing changed that should affect this test
+
+          Always explain your reasoning when assigning the score.
+
+          ## Editing rules — STRICT
+
+          - ALLOWED: tests/**/*.spec.js, playwright.config.js (timeouts only)
+          - FORBIDDEN: server.js, public/**, package.json — never modify application code
+          - Only fix tests with p_test_outdated > 0.7
+
+          After fixing, run npx playwright test with CI=true to verify.
+          If a healed test still fails after 2 attempts, mark it test.fixme() with a comment.
+
+          ## Report format (.github/self-heal-report.md)
+
+          Write the report in this exact markdown structure:
+
+          # Self-Healing Report
+
+          **Commit:** <full sha>
+          **Date:** <ISO 8601 date>
+          **Status:** Fixed | Partially fixed | Diagnostic only
+
+          ## Summary
+          <1-2 sentence overview>
+
+          ## P(test outdated) Assessment
+
+          | Test name | P(test outdated) | Verdict | Reasoning |
+          |-----------|-----------------:|---------|-----------|
+          | <name> | <0.0-1.0> | Self-heal / Diagnostic only / Probable app bug | <why this score> |
+
+          ## Changes
+
+          ### <test file path>
+
+          | Test name | Status | Root cause | Fix applied |
+          |-----------|--------|------------|-------------|
+          | <name> | Fixed / Skipped (fixme) / Not modified | <what broke and why> | <what was changed, or "N/A"> |
+
+          **Diff:**
+          <code block with the exact diff, or "No changes — diagnostic only">
+
+          ## Verification
+          - Tests healed: X
+          - Tests flagged (diagnostic only): Y
+          - Tests skipped (fixme): Z
+          - Playwright exit code: <code>
+
+          ## Notes
+          <additional context, warnings, or recommendations>
+          <if any test scored < 0.4: "Warning: Probable application bug detected — manual investigation required">
+          PROMPT
+
+      - name: Run Claude Code self-healing agent
+        env:
+          CLAUDE_CODE_OAUTH_TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          CI: "true"
+        run: |
+          cat /tmp/heal-prompt.txt | claude --print --max-turns 10 \
+            --allowedTools "Read,Edit,Write,Glob,Grep,Bash(npx playwright test:*),Bash(cat:*),Bash(git diff:*)"
+
+      - name: Create pull request
+        uses: peter-evans/create-pull-request@v6
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          branch: self-heal/${{ github.sha }}
+          commit-message: |
+            fix(tests): self-heal failing E2E tests
+
+            [skip-heal]
+          title: "[self-heal] Fix failing E2E tests — ${{ github.sha }}"
+          body-path: .github/self-heal-report.md
+          labels: |
+            self-healing
+            needs-review
+            automated
+          delete-branch: true
