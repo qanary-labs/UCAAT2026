@@ -34,7 +34,7 @@ adminRouter.get("/session", (req, res) => {
 app.use(staticMiddleware(publicDir));
 app.use(urlencoded({ extended: false }));
 
-app.post("/login", (req, res) => {
+app.post("/logiiiiin", (req, res) => {
   const { username, password } = req.body;
 
   if (username === "admin" && password === "password") {
